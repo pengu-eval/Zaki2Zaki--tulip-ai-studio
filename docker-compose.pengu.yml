@@ -1,0 +1,221 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:56725:56725"
+  supabase-db:
+    image: supabase/postgres:15.8.1.060
+    environment:
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "localhost"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+  supabase-migrate:
+    image: supabase/postgres:15.8.1.060
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: postgres
+    volumes:
+      - ./supabase/migrations:/migrations:ro
+      - ./supabase/seed.pengu.sql:/seed.sql:ro
+    entrypoint: ["psql", "-h", "supabase-db", "-U", "supabase_admin", "-d", "postgres", "-q", "-c", "alter role authenticator with password 'postgres'; alter role supabase_auth_admin with password 'postgres';", "-f", "/migrations/20260308055955_c8eeaff0-2f3d-4d8e-8da7-4c48d352183d.sql", "-f", "/migrations/20260308094553_bb6bdb60-8743-4311-b1ba-c0fd1fd31225.sql", "-f", "/migrations/20260308094843_6bd209da-e65f-4d26-aa1e-6536826598af.sql", "-f", "/migrations/20260316235952_096c2225-9aab-4a95-aa21-df234ecbc2bb.sql", "-f", "/migrations/20260418035711_e9c59798-fb11-4a5b-9057-4bc7698fbe64.sql", "-f", "/seed.sql"]
+  supabase-auth:
+    image: supabase/gotrue:v2.174.0
+    depends_on:
+      supabase-migrate:
+        condition: service_completed_successfully
+    restart: on-failure
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: "9999"
+      API_EXTERNAL_URL: http://127.0.0.1:56725/__supabase/auth/v1
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:postgres@supabase-db:5432/postgres
+      GOTRUE_SITE_URL: http://localhost:3000
+      GOTRUE_URI_ALLOW_LIST: "*"
+      GOTRUE_DISABLE_SIGNUP: "false"
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: "3600"
+      GOTRUE_JWT_SECRET: mock-preview-signing-secret-for-local-supabase-only
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+  supabase-rest:
+    image: postgrest/postgrest:v12.2.12
+    depends_on:
+      supabase-migrate:
+        condition: service_completed_successfully
+    restart: on-failure
+    environment:
+      PGRST_DB_URI: postgres://authenticator:postgres@supabase-db:5432/postgres
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: mock-preview-signing-secret-for-local-supabase-only
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+  supabase-functions:
+    image: supabase/edge-runtime:v1.67.4
+    depends_on: [supabase-auth, supabase-rest]
+    restart: on-failure
+    environment:
+      SUPABASE_URL: http://app:56725/__supabase
+      SUPABASE_ANON_KEY: pengu-preview-anon-key
+      SUPABASE_SERVICE_ROLE_KEY: pengu-preview-anon-key
+      SUPABASE_DB_URL: postgresql://postgres:postgres@supabase-db:5432/postgres
+      VERIFY_JWT: "false"
+      PENGU_INBOX_API: "http://mailpit:8025/__inbox/api/v1/send"
+    volumes:
+      - ./supabase/functions:/home/deno/functions:ro
+      - ./supabase/.pengu/functions:/home/deno/pengu:ro
+    configs:
+      - source: pengu-functions-main
+        target: /home/deno/main/index.ts
+    command: ["start", "--main-service", "/home/deno/main"]
+  supabase-demo-user:
+    image: curlimages/curl:8.10.1
+    depends_on: [supabase-auth]
+    entrypoint: ["curl", "-s", "--retry", "30", "--retry-connrefused", "--retry-delay", "1", "-X", "POST", "http://supabase-auth:9999/signup", "-H", "Content-Type: application/json", "-d", "{\"email\":\"demo@example.com\",\"password\":\"pengu-demo-pass\"}"]
+  mailpit:
+    image: axllent/mailpit:v1.21.8
+    environment:
+      MP_WEBROOT: "__inbox"
+  pengu-door:
+    image: nginx:1.27-alpine
+    network_mode: "service:app"
+    depends_on: [app, supabase-auth, supabase-rest, supabase-functions, mailpit]
+    configs:
+      - source: pengu-door
+        target: /etc/nginx/conf.d/default.conf
+configs:
+  pengu-door:
+    content: |
+      map "$$http_authorization|$$http_apikey" $$pengu_authorization {
+        default $$http_authorization;
+        "~^Bearer (.+)\|\1$$" "";
+      }
+
+      map $$http_upgrade $$pengu_connection {
+        default upgrade;
+        "" close;
+      }
+
+      map $$upstream_http_content_security_policy $$pengu_csp {
+        default $$upstream_http_content_security_policy;
+        "~^(?<before>.*?)frame-ancestors[^;]*;?\s*(?<after>.*)$$" "$$before$$after";
+      }
+
+      server {
+        listen 56725;
+
+        location /__supabase/rest/v1/ {
+          if ($$request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin * always;
+            add_header Access-Control-Allow-Headers * always;
+            add_header Access-Control-Allow-Methods * always;
+            add_header Access-Control-Expose-Headers * always;
+            return 204;
+          }
+          proxy_hide_header Access-Control-Allow-Origin;
+          proxy_hide_header Access-Control-Allow-Headers;
+          proxy_hide_header Access-Control-Allow-Methods;
+          proxy_hide_header Access-Control-Expose-Headers;
+          add_header Access-Control-Allow-Origin * always;
+          add_header Access-Control-Allow-Headers * always;
+          add_header Access-Control-Allow-Methods * always;
+          add_header Access-Control-Expose-Headers * always;
+          proxy_set_header Authorization $$pengu_authorization;
+          proxy_pass http://supabase-rest:3000/;
+        }
+
+        location /__supabase/auth/v1/ {
+          if ($$request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin * always;
+            add_header Access-Control-Allow-Headers * always;
+            add_header Access-Control-Allow-Methods * always;
+            add_header Access-Control-Expose-Headers * always;
+            return 204;
+          }
+          proxy_hide_header Access-Control-Allow-Origin;
+          proxy_hide_header Access-Control-Allow-Headers;
+          proxy_hide_header Access-Control-Allow-Methods;
+          proxy_hide_header Access-Control-Expose-Headers;
+          add_header Access-Control-Allow-Origin * always;
+          add_header Access-Control-Allow-Headers * always;
+          add_header Access-Control-Allow-Methods * always;
+          add_header Access-Control-Expose-Headers * always;
+          proxy_pass http://supabase-auth:9999/;
+        }
+
+        location /__supabase/functions/v1/ {
+          if ($$request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin * always;
+            add_header Access-Control-Allow-Headers * always;
+            add_header Access-Control-Allow-Methods * always;
+            add_header Access-Control-Expose-Headers * always;
+            return 204;
+          }
+          proxy_hide_header Access-Control-Allow-Origin;
+          proxy_hide_header Access-Control-Allow-Headers;
+          proxy_hide_header Access-Control-Allow-Methods;
+          proxy_hide_header Access-Control-Expose-Headers;
+          add_header Access-Control-Allow-Origin * always;
+          add_header Access-Control-Allow-Headers * always;
+          add_header Access-Control-Allow-Methods * always;
+          add_header Access-Control-Expose-Headers * always;
+          proxy_pass http://supabase-functions:9000/;
+        }
+
+        location /__inbox/ {
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $$http_upgrade;
+          proxy_set_header Connection $$pengu_connection;
+          proxy_pass http://mailpit:8025;
+        }
+
+        location / {
+          proxy_http_version 1.1;
+          proxy_set_header Host $$host;
+          proxy_set_header Upgrade $$http_upgrade;
+          proxy_set_header Connection $$pengu_connection;
+          proxy_hide_header X-Frame-Options;
+          proxy_hide_header Content-Security-Policy;
+          add_header Content-Security-Policy $$pengu_csp always;
+          proxy_pass http://127.0.0.1:80;
+        }
+      }
+  pengu-functions-main:
+    content: |
+      async function entryOf(name) {
+        const entry = "/home/deno/pengu/entries/" + name + ".mjs";
+        try {
+          await Deno.stat(entry);
+          return "file://" + entry;
+        } catch {
+          return undefined;
+        }
+      }
+      
+      Deno.serve(async (req) => {
+        const name = new URL(req.url).pathname.split("/").filter(Boolean)[0];
+        if (!name) {
+          return new Response(JSON.stringify({ error: "missing function name" }), { status: 400, headers: { "Content-Type": "application/json" } });
+        }
+        try {
+          const worker = await EdgeRuntime.userWorkers.create({
+            servicePath: "/home/deno/functions/" + name,
+            maybeEntrypoint: await entryOf(name),
+            memoryLimitMb: 150,
+            workerTimeoutMs: 60000,
+            noModuleCache: false,
+            envVars: Object.entries(Deno.env.toObject()),
+          });
+          return await worker.fetch(req);
+        } catch (err) {
+          return new Response(JSON.stringify({ error: String(err) }), { status: 500, headers: { "Content-Type": "application/json" } });
+        }
+      });
